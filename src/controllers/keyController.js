@@ -26,7 +26,7 @@ export function encryptPrivateKeyServerSide(rawKeyData) {
   };
 }
 
-// @desc    Register or update public key and encrypted private key for logged in user
+// @desc    Register or update public key and encrypted private key for logged in user or target user
 // @route   POST /api/keys
 // @access  Private
 export const registerKey = async (req, res, next) => {
@@ -41,6 +41,8 @@ export const registerKey = async (req, res, next) => {
       privateKeyIv,
       privateKeySalt,
       algorithm,
+      userId,
+      targetUserId,
     } = req.body;
 
     if (!uniqueKey || !fingerprint || !publicKey) {
@@ -48,6 +50,13 @@ export const registerKey = async (req, res, next) => {
         message: 'uniqueKey, fingerprint, and publicKey are required to register keys',
       });
     }
+
+    const effectiveUserId =
+      (userId && /^[0-9a-fA-F]{24}$/.test(userId))
+        ? userId
+        : (targetUserId && /^[0-9a-fA-F]{24}$/.test(targetUserId))
+        ? targetUserId
+        : req.user._id;
 
     const updateData = {
       uniqueKey,
@@ -71,7 +80,7 @@ export const registerKey = async (req, res, next) => {
       // If no private key sent at all, generate an encrypted RSA private key placeholder
       const enc = encryptPrivateKeyServerSide({
         type: 'RSA-OAEP-2048-PRIVATE-KEY',
-        userId: req.user._id.toString(),
+        userId: effectiveUserId.toString(),
         createdAt: new Date().toISOString(),
       });
       updateData.encryptedPrivateKey = enc.encryptedPrivateKey;
@@ -80,7 +89,7 @@ export const registerKey = async (req, res, next) => {
     }
 
     const key = await Key.findOneAndUpdate(
-      { user: req.user._id },
+      { user: effectiveUserId },
       updateData,
       { new: true, upsert: true, runValidators: true }
     );
