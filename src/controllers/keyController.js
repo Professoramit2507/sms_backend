@@ -15,18 +15,148 @@ export function encryptPrivateKeyServerSide(rawKeyData) {
   const cipher = crypto.createCipheriv('aes-256-gcm', derivedKey, iv);
 
   const text = typeof rawKeyData === 'object' ? JSON.stringify(rawKeyData) : String(rawKeyData);
-  let encrypted = cipher.update(text, 'utf8', 'base64');
-  encrypted += cipher.final('base64');
+  const ciphertext = Buffer.concat([cipher.update(text, 'utf8'), cipher.final()]).toString('base64');
   const authTag = cipher.getAuthTag().toString('base64');
 
   return {
-    encryptedPrivateKey: `${encrypted}:${authTag}`,
+    encryptedPrivateKey: `${ciphertext}:${authTag}`,
     privateKeyIv: iv.toString('base64'),
     privateKeySalt: salt.toString('base64'),
   };
 }
 
-// @desc    Register or update public key and encrypted private key for logged in user or target user
+/**
+ * Generate a new RSA-2048 key pair server-side
+ */
+export function generateServerKeyPair() {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', {
+    modulusLength: 2048,
+    publicKeyEncoding: {
+      type: 'spki',
+      format: 'pem',
+    },
+    privateKeyEncoding: {
+      type: 'pkcs8',
+      format: 'pem',
+    },
+  });
+
+  const cleanPublicKey = publicKey
+    .replace(/-----BEGIN PUBLIC KEY-----/g, '')
+    .replace(/-----END PUBLIC KEY-----/g, '')
+    .replace(/\s+/g, '');
+
+  const fingerprintHex = crypto
+    .createHash('sha256')
+    .update(cleanPublicKey)
+    .digest('hex')
+    .toUpperCase()
+    .match(/.{1,2}/g)
+    .slice(0, 16)
+    .join(':');
+
+  const randomHex = crypto.randomBytes(8).toString('hex').toUpperCase();
+  const uniqueKey = `RCV-KEY-${randomHex.slice(0, 4)}-${randomHex.slice(4, 8)}-${randomHex.slice(8, 12)}-${randomHex.slice(12, 16)}`;
+
+  return {
+    publicKey: cleanPublicKey,
+    privateKeyPem: privateKey,
+    fingerprint: `SHA256:${fingerprintHex}`,
+    uniqueKey,
+  };
+}
+
+/**
+ * Helper to ensure a user's keys are stored in MongoDB every time.
+ * Public key is stored normally (plaintext string),
+ * Private key is stored strictly encrypted (AES-256-GCM ciphertext).
+ */
+export async function createOrUpdateUserKey(userId, keyData = {}) {
+  // If user already has a key in DB and no new key was explicitly provided, KEEP THE SAME KEY!
+  const existingKey = await Key.findOne({ user: userId }).select('+encryptedPrivateKey +privateKeyIv +privateKeySalt');
+  if (existingKey && !keyData.publicKey && !keyData.uniqueKey) {
+    return existingKey;
+  }
+
+  let {
+    uniqueKey,
+    fingerprint,
+    publicKey,
+    encryptedPrivateKey,
+    privateKey,
+    privateKeyJwk,
+    privateKeyIv,
+    privateKeySalt,
+    algorithm,
+  } = keyData;
+
+  // 1. If no public key provided, generate a fresh RSA keypair
+  if (!publicKey) {
+    const pair = generateServerKeyPair();
+    publicKey = pair.publicKey;
+    uniqueKey = uniqueKey || pair.uniqueKey;
+    fingerprint = fingerprint || pair.fingerprint;
+    const enc = encryptPrivateKeyServerSide(pair.privateKeyPem);
+    encryptedPrivateKey = enc.encryptedPrivateKey;
+    privateKeyIv = enc.privateKeyIv;
+    privateKeySalt = enc.privateKeySalt;
+  } else if (!encryptedPrivateKey) {
+    // If public key is provided but encryptedPrivateKey is missing, encrypt whatever private key was provided
+    if (privateKey || privateKeyJwk) {
+      const enc = encryptPrivateKeyServerSide(privateKey || privateKeyJwk);
+      encryptedPrivateKey = enc.encryptedPrivateKey;
+      privateKeyIv = enc.privateKeyIv;
+      privateKeySalt = enc.privateKeySalt;
+    } else {
+      const enc = encryptPrivateKeyServerSide({
+        type: 'RSA-OAEP-2048-PRIVATE-KEY',
+        userId: userId.toString(),
+        createdAt: new Date().toISOString(),
+      });
+      encryptedPrivateKey = enc.encryptedPrivateKey;
+      privateKeyIv = enc.privateKeyIv;
+      privateKeySalt = enc.privateKeySalt;
+    }
+  }
+
+  if (!uniqueKey) {
+    const randomHex = crypto.randomBytes(8).toString('hex').toUpperCase();
+    uniqueKey = `RCV-KEY-${randomHex.slice(0, 4)}-${randomHex.slice(4, 8)}-${randomHex.slice(8, 12)}-${randomHex.slice(12, 16)}`;
+  }
+
+  if (!fingerprint) {
+    const hash = crypto
+      .createHash('sha256')
+      .update(publicKey)
+      .digest('hex')
+      .toUpperCase()
+      .match(/.{1,2}/g)
+      .slice(0, 16)
+      .join(':');
+    fingerprint = `SHA256:${hash}`;
+  }
+
+  const updateData = {
+    user: userId,
+    uniqueKey,
+    fingerprint,
+    publicKey, // Normal plaintext SPKI/PEM key stored in DB
+    encryptedPrivateKey, // Strictly AES-256-GCM encrypted in DB
+    privateKeyIv: privateKeyIv || '',
+    privateKeySalt: privateKeySalt || '',
+    algorithm: algorithm || 'RSA-OAEP-2048+AES-GCM',
+  };
+
+  const key = await Key.findOneAndUpdate(
+    { user: userId },
+    updateData,
+    { new: true, upsert: true, runValidators: true }
+  );
+
+  return key;
+}
+
+// @desc    Register or update public key and encrypted private key
 // @route   POST /api/keys
 // @access  Private
 export const registerKey = async (req, res, next) => {
@@ -45,12 +175,6 @@ export const registerKey = async (req, res, next) => {
       targetUserId,
     } = req.body;
 
-    if (!uniqueKey || !fingerprint || !publicKey) {
-      return res.status(400).json({
-        message: 'uniqueKey, fingerprint, and publicKey are required to register keys',
-      });
-    }
-
     const effectiveUserId =
       (userId && /^[0-9a-fA-F]{24}$/.test(userId))
         ? userId
@@ -58,46 +182,63 @@ export const registerKey = async (req, res, next) => {
         ? targetUserId
         : req.user._id;
 
-    const updateData = {
+    const key = await createOrUpdateUserKey(effectiveUserId, {
       uniqueKey,
       fingerprint,
-      publicKey, // Public key stored normally in database for senders
-      algorithm: algorithm || 'ElGamal+DES (RSA-OAEP+AES-GCM)',
-    };
+      publicKey,
+      encryptedPrivateKey,
+      privateKey,
+      privateKeyJwk,
+      privateKeyIv,
+      privateKeySalt,
+      algorithm,
+    });
 
-    // Guarantee that Private Key is ALWAYS stored encrypted in MongoDB!
-    if (encryptedPrivateKey) {
-      updateData.encryptedPrivateKey = encryptedPrivateKey;
-      updateData.privateKeyIv = privateKeyIv || '';
-      updateData.privateKeySalt = privateKeySalt || '';
-    } else if (privateKey || privateKeyJwk) {
-      // If a client sends raw private key directly, AUTOMATICALLY ENCRYPT with AES-256-GCM before saving!
-      const enc = encryptPrivateKeyServerSide(privateKey || privateKeyJwk);
-      updateData.encryptedPrivateKey = enc.encryptedPrivateKey;
-      updateData.privateKeyIv = enc.privateKeyIv;
-      updateData.privateKeySalt = enc.privateKeySalt;
-    } else {
-      // If no private key sent at all, generate an encrypted RSA private key placeholder
-      const enc = encryptPrivateKeyServerSide({
-        type: 'RSA-OAEP-2048-PRIVATE-KEY',
-        userId: effectiveUserId.toString(),
-        createdAt: new Date().toISOString(),
-      });
-      updateData.encryptedPrivateKey = enc.encryptedPrivateKey;
-      updateData.privateKeyIv = enc.privateKeyIv;
-      updateData.privateKeySalt = enc.privateKeySalt;
-    }
+    res.status(201).json({
+      success: true,
+      message: 'Cryptographic keys registered successfully. Public key stored normally, private key stored encrypted in DB.',
+      key,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Generate a fresh key pair (public key normal, private key encrypted)
+// @route   POST /api/keys/generate
+// @access  Private
+export const generateNewKey = async (req, res, next) => {
+  try {
+    const pair = generateServerKeyPair();
+    const enc = encryptPrivateKeyServerSide(pair.privateKeyPem);
 
     const key = await Key.findOneAndUpdate(
-      { user: effectiveUserId },
-      updateData,
+      { user: req.user._id },
+      {
+        user: req.user._id,
+        uniqueKey: pair.uniqueKey,
+        fingerprint: pair.fingerprint,
+        publicKey: pair.publicKey, // Normal
+        encryptedPrivateKey: enc.encryptedPrivateKey, // Encrypted
+        privateKeyIv: enc.privateKeyIv,
+        privateKeySalt: enc.privateKeySalt,
+        algorithm: 'RSA-OAEP-2048+AES-GCM',
+      },
       { new: true, upsert: true, runValidators: true }
     );
 
     res.status(201).json({
       success: true,
-      message: 'Cryptographic keys registered successfully. Private key stored encrypted in DB.',
-      key,
+      message: 'New key pair generated successfully. Public key stored normally, private key stored encrypted.',
+      key: {
+        id: key._id.toString(),
+        userId: key.user.toString(),
+        uniqueKey: key.uniqueKey,
+        fingerprint: key.fingerprint,
+        publicKey: key.publicKey,
+        encryptedPrivateKey: enc.encryptedPrivateKey,
+        algorithm: key.algorithm,
+      },
     });
   } catch (error) {
     next(error);
@@ -109,9 +250,9 @@ export const registerKey = async (req, res, next) => {
 // @access  Private
 export const getMyKey = async (req, res, next) => {
   try {
-    const key = await Key.findOne({ user: req.user._id }).select('+encryptedPrivateKey +privateKeyIv +privateKeySalt');
+    let key = await Key.findOne({ user: req.user._id }).select('+encryptedPrivateKey +privateKeyIv +privateKeySalt');
     if (!key) {
-      return res.status(404).json({ message: 'No cryptographic key registered yet' });
+      key = await createOrUpdateUserKey(req.user._id);
     }
 
     res.json({
@@ -139,7 +280,10 @@ export const getMyKey = async (req, res, next) => {
 // @access  Private
 export const getKeyStatus = async (req, res, next) => {
   try {
-    const key = await Key.findOne({ user: req.user._id }).select('+encryptedPrivateKey +privateKeyIv +privateKeySalt');
+    let key = await Key.findOne({ user: req.user._id }).select('+encryptedPrivateKey +privateKeyIv +privateKeySalt');
+    if (!key) {
+      key = await createOrUpdateUserKey(req.user._id);
+    }
     res.json({
       hasKey: !!key,
       hasPrivateKey: !!(key && key.encryptedPrivateKey),
@@ -169,9 +313,10 @@ export const getKeyByUserId = async (req, res, next) => {
       return res.status(404).json({ message: 'User not found' });
     }
 
-    const key = await Key.findOne({ user: targetUser._id });
+    let key = await Key.findOne({ user: targetUser._id });
     if (!key) {
-      return res.status(404).json({ message: 'Recipient has not published an encryption key yet' });
+      // Auto-create key for user if missing so DB always holds their keys
+      key = await createOrUpdateUserKey(targetUser._id);
     }
 
     // Return ONLY public key and metadata. NEVER return encryptedPrivateKey to others!
@@ -181,7 +326,7 @@ export const getKeyByUserId = async (req, res, next) => {
         username: targetUser.username,
         uniqueKey: key.uniqueKey,
         fingerprint: key.fingerprint,
-        publicKey: key.publicKey,
+        publicKey: key.publicKey, // Normal public key
         algorithm: key.algorithm,
         createdAt: key.createdAt,
       },

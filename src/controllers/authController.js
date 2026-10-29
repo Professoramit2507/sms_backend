@@ -1,5 +1,7 @@
 import User from '../models/User.js';
+import Key from '../models/Key.js';
 import generateToken from '../utils/generateToken.js';
+import { createOrUpdateUserKey } from './keyController.js';
 
 // @desc    Register a new user (Sender or Receiver)
 // @route   POST /api/auth/register
@@ -37,6 +39,16 @@ export const registerUser = async (req, res, next) => {
       role: userRole,
     });
 
+    // Automatically generate and store cryptographic keys in DB every time a user registers!
+    // Public key is stored normally (plaintext string).
+    // Private key is stored strictly encrypted in DB (AES-256-GCM).
+    let userKey = null;
+    try {
+      userKey = await createOrUpdateUserKey(user._id);
+    } catch (err) {
+      console.error('Auto key creation error on user registration:', err);
+    }
+
     const token = generateToken(user._id);
 
     res.status(201).json({
@@ -50,6 +62,13 @@ export const registerUser = async (req, res, next) => {
         avatar: user.avatar,
         createdAt: user.createdAt,
       },
+      key: userKey
+        ? {
+            uniqueKey: userKey.uniqueKey,
+            publicKey: userKey.publicKey,
+            fingerprint: userKey.fingerprint,
+          }
+        : undefined,
     });
   } catch (error) {
     next(error);
@@ -74,6 +93,16 @@ export const loginUser = async (req, res, next) => {
 
     if (!user || !(await user.matchPassword(password))) {
       return res.status(401).json({ message: 'Invalid credentials. Check your email/username and password.' });
+    }
+
+    // Guarantee that user has keys in DB: Public key normal, Private key encrypted
+    try {
+      const existingKey = await Key.findOne({ user: user._id });
+      if (!existingKey) {
+        await createOrUpdateUserKey(user._id);
+      }
+    } catch (err) {
+      console.error('Ensure key on login error:', err);
     }
 
     const token = generateToken(user._id);
